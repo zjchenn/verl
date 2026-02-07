@@ -23,6 +23,7 @@ from transformers.activations import ACT2FN
 from transformers.models.qwen2 import modeling_qwen2
 from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
 from transformers.models.qwen3 import modeling_qwen3
+from transformers.models.qwen3_next import modeling_qwen3_next
 from transformers.models.qwen3_moe import modeling_qwen3_moe
 from transformers.models.qwen3_vl import modeling_qwen3_vl
 from transformers.models.qwen3_vl_moe import modeling_qwen3_vl_moe
@@ -105,9 +106,13 @@ class NPUGmmFunction(torch.autograd.Function):
         return dx, dw, None, None
 
 
-def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    """NPU optimized implementation for `forward` in Qwen3MoeSparseMoeBlock."""
-    # hidden_states: (batch_size, sequence_length, hidden_size)
+def _qwen3_sparse_moe_routed_forward_npu(self, hidden_states: torch.Tensor):
+    """
+    Shared NPU routed-expert path for Qwen3Moe/Qwen3Next sparse MoE blocks.
+
+    Returns:
+        tuple: (flattened_input, routed_hidden_states, router_logits)
+    """
     hidden_dim = hidden_states.shape[-1]
     hidden_states = hidden_states.view(-1, hidden_dim)
     # router_logits: (batch * sequence_length, n_experts)
@@ -138,8 +143,28 @@ def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) ->
     act_res = torch_npu.npu_swiglu(torch.cat([gate_res, up_res], dim=-1))
     down_res = NPUGmmFunction.apply(act_res, w3, tokens_per_expert)
 
-    final_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
+    routed_hidden_states = torch_npu.npu_moe_token_unpermute(down_res, row_ids_map, probs=routing_weights)
 
+    return hidden_states, routed_hidden_states, router_logits
+
+
+def qwen3_moe_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """NPU optimized implementation for `forward` in Qwen3MoeSparseMoeBlock."""
+    output_shape = hidden_states.shape
+    _, routed_hidden_states, router_logits = _qwen3_sparse_moe_routed_forward_npu(self, hidden_states)
+    final_hidden_states = routed_hidden_states.reshape(output_shape)
+    return final_hidden_states, router_logits
+
+
+def qwen3_next_sparse_moe_block_forward_npu(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    """NPU optimized implementation for `forward` in Qwen3NextSparseMoeBlock."""
+    output_shape = hidden_states.shape
+    hidden_states, routed_hidden_states, router_logits = _qwen3_sparse_moe_routed_forward_npu(self, hidden_states)
+
+    shared_expert_output = self.shared_expert(hidden_states)
+    shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared_expert_output
+
+    final_hidden_states = (routed_hidden_states + shared_expert_output).reshape(output_shape)
     return final_hidden_states, router_logits
 
 
@@ -250,6 +275,12 @@ modeling_qwen3.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 modeling_qwen3_moe.Qwen3MoeRMSNorm.forward = rms_norm_forward_npu
 modeling_qwen3_moe.Qwen3MoeSparseMoeBlock.forward = qwen3_moe_sparse_moe_block_forward_npu
 modeling_qwen3_moe.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
+
+# Patches for Qwen3 Next Model
+modeling_qwen3_next.Qwen3NextRMSNorm.forward = rms_norm_forward_npu
+modeling_qwen3_next.Qwen3NextMLP.forward = silu_forward_npu
+modeling_qwen3_next.Qwen3NextSparseMoeBlock.forward = qwen3_next_sparse_moe_block_forward_npu
+modeling_qwen3_next.apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 
 # Patches for Qwen3 VL Model
 modeling_qwen3_vl.Qwen3VLTextRMSNorm.forward = rms_norm_forward_npu

@@ -210,6 +210,13 @@ class vLLMColocateWorkerExtension:
             buffer, shm = rebuild_shared_memory(shm_name, shm_size, dtype=torch.uint8)
         socket.send(b"")
 
+        use_standard_weight_load = not (peft_config and base_sync_done) and not is_fp8_model(
+            self.model_runner.vllm_config
+        )
+        # Patch once per full update round for standard (non-FP8, non-LoRA-only) loading.
+        if use_standard_weight_load:
+            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
         # receive bucket and update weights
         while True:
             metadata = socket.recv_pyobj()
@@ -232,6 +239,14 @@ class vLLMColocateWorkerExtension:
             del weights, tensor
             if metadata["is_last"]:
                 break
+
+        if use_standard_weight_load:
+            # Some post-load transforms are non-idempotent; run once after all buckets.
+            from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+            model = self.model_runner.model
+            model_config = self.model_runner.vllm_config.model_config
+            process_weights_after_loading(model, model_config, self.device)
 
         # clean up
         socket.close()
@@ -266,7 +281,8 @@ class vLLMColocateWorkerExtension:
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
-                self.model_runner.model.load_weights(weights)
+                model = self.model_runner.model
+                model.load_weights(weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""

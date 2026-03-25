@@ -237,6 +237,42 @@ class MegatronPPOActor(BasePPOActor):
             log_probs = output["log_probs"][:, -response_length - 1 : -1].contiguous()
             return {"log_probs": log_probs}
 
+        def collect_forward_only_micro_outputs(micro_outputs, expect_entropy=False):
+            """Collect micro-batch outputs produced by loss_func(forward_only=True).
+
+            Depending on PP/VPP schedule and model chunk placement, each item in
+            `micro_outputs` may be:
+            - dict: {"log_probs": ...}
+            - list/tuple: [metrics_dict, entropy_tensor_or_none]
+            - empty dict for non-post-process chunks
+            """
+            log_probs_list = []
+            entropy_list = []
+
+            for item in micro_outputs:
+                metrics = None
+                entropy = None
+
+                if isinstance(item, dict):
+                    metrics = item
+                elif isinstance(item, (list, tuple)):
+                    if len(item) > 0 and isinstance(item[0], dict):
+                        metrics = item[0]
+                    if len(item) > 1 and torch.is_tensor(item[1]):
+                        entropy = item[1]
+
+                if isinstance(metrics, dict) and "log_probs" in metrics:
+                    log_probs_list.append(metrics["log_probs"])
+                    if expect_entropy:
+                        if entropy is None:
+                            raise RuntimeError(
+                                "Found micro-batch output with log_probs but missing entropy while "
+                                "calculate_entropy=True."
+                            )
+                        entropy_list.append(entropy)
+
+            return log_probs_list, entropy_list
+
         # We make recompute_old_log_prob by default here.
         # TODO (zhangchi.usc1992): actually, this function should only return log_prob and this logic should be
         # handled by user outside
@@ -265,13 +301,28 @@ class MegatronPPOActor(BasePPOActor):
                     micro_batch_size=micro_batch_size,
                     max_token_len=max_token_len,
                 )
+                entropy_micro_batches = None
                 if mpu.is_pipeline_last_stage(ignore_virtual=True):
                     # only on last rank. It should be on every tp rank
-                    if calculate_entropy:
-                        log_probs = [o[0]["log_probs"] for o in output["output"]]  # (bs, seq_size)
-                    else:
-                        log_probs = [o["log_probs"] for o in output["output"]]  # (bs, seq_size)
-                    log_probs = torch.cat(log_probs, dim=0).to(torch.float32)
+                    log_prob_micro_batches, entropy_micro_batches = collect_forward_only_micro_outputs(
+                        output["output"], expect_entropy=calculate_entropy
+                    )
+                    if len(log_prob_micro_batches) == 0:
+                        post_process_flags = [
+                            bool(getattr(unwrap_model(m), "post_process", False)) for m in self.actor_module
+                        ]
+                        raise RuntimeError(
+                            "No micro-batch output contains `log_probs` on pipeline last rank. "
+                            f"pp_rank={mpu.get_pipeline_model_parallel_rank()}, "
+                            f"pp_world={mpu.get_pipeline_model_parallel_world_size()}, "
+                            f"vpp_local_chunks={len(self.actor_module)}, "
+                            f"post_process_flags={post_process_flags}, "
+                            f"num_micro_outputs={len(output['output'])}. "
+                            "This usually means the schedule/chunk producing outputs here does not have "
+                            "`post_process=True`."
+                        )
+
+                    log_probs = torch.cat(log_prob_micro_batches, dim=0).to(torch.float32)
                     if use_dynamic_bsz:
                         indices = output["indices"]
                         indices = list(itertools.chain.from_iterable(indices))
@@ -294,7 +345,8 @@ class MegatronPPOActor(BasePPOActor):
                 if calculate_entropy:
                     # Note that o[0] is metrics, o[1] is entropy
                     if mpu.is_pipeline_last_stage(ignore_virtual=True):
-                        entropys = torch.cat([o[1] for o in output["output"]], dim=0)
+                        assert entropy_micro_batches is not None
+                        entropys = torch.cat(entropy_micro_batches, dim=0)
                         entropys = entropys.to(torch.float32)
                         if use_dynamic_bsz:
                             indices = output["indices"]
@@ -489,11 +541,15 @@ class MegatronPPOActor(BasePPOActor):
                 if post_process_fn is None:
                     pass
                     # metrics["logits"] = output
-                else:
+                elif isinstance(output, dict):
                     stats = post_process_fn(output, data)
                     metrics.update(stats)
                 if not calculate_entropy:
                     return torch.tensor(1.0, device=device), metrics
+                # For pp non-last stages, output is hidden states tensor. Keep
+                # forward_only return structure consistent with entropy branch.
+                if not isinstance(output, dict):
+                    return torch.tensor(1.0, device=device), [metrics, None]
 
             responses = data["responses"]
             response_length = responses.size(1)

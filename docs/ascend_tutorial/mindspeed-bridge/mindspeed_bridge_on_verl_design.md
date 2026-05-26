@@ -2,23 +2,45 @@
 
 Last updated: 05/26/2026.
 
-## 1. 背景、目标与结论
+## 1. 总览：本文目标、范围与核心结论
 
-本文基于本地源码说明 `mindspeed_bridge` 如何接入 `verl` 的 Megatron-Core 训练路径，重点覆盖：
+### 1.1 文档目标
 
-- Megatron-Bridge 本身的组成、注册机制，以及在 `verl` 中承担的角色。
-- MindSpeed-Bridge 作为 Ascend / NPU 适配层提供了哪些增量，以及为什么这些增量足够。
-- 为什么只在 `verl/verl/models/mcore/bridge.py` 中导入 `mindspeed_bridge.models` 就能让新模型桥接生效。
-- Qwen3.5-VL 中 Gated DeltaNet（GDN）算子的三条执行路径。
+本文基于本地源码说明 `mindspeed_bridge` 如何接入 `verl` 的 Megatron-Core 训练路径。重点回答四个问题：
 
-核心结论：
+1. Megatron-Bridge 本身包括哪些东西，在 `verl` 里如何发挥作用。
+2. MindSpeed-Bridge 里有哪些东西，为什么这些东西足够完成 Qwen3.5-VL 在 Ascend / NPU 场景的适配。
+3. 为什么只在 `verl/verl/models/mcore/bridge.py` 里 `import mindspeed_bridge.models` 就能让新模型生效。
+4. MindSpeed-Bridge 中 GDN 算子的几条执行路径，特别是 `gated_delta_net.py:194` 处的分发逻辑。
 
-1. `verl` 并不直接识别每个模型架构；在非 `vanilla_mbridge` 路径里，它把 HF 配置、模型构造和权重转换委托给 Megatron-Bridge 的 `AutoBridge`。
-2. Megatron-Bridge 的模型支持是“导入即注册”：桥接类在 import 时通过 `@MegatronModelBridge.register_bridge(...)` 写入全局 dispatch registry。
-3. MindSpeed-Bridge 只需要提供 Qwen3.5-VL 相关的 bridge、provider、Megatron 模型实现、权重映射和 NPU GDN 算子路径；`verl` 的 engine、checkpoint、PEFT、DDP 包装等仍复用现有链路。
-4. `import mindspeed_bridge.models` 的作用不是被 `verl` 直接调用，而是触发 MindSpeed-Bridge 中 Qwen3.5-VL bridge 类定义，从而把新架构注册进 Megatron-Bridge 的同一个 registry。
+### 1.2 核心结论
 
-## 2. Megatron-Bridge 本身包括什么
+`verl` 并不直接识别每个 Megatron 模型架构。在非 `vanilla_mbridge` 路径里，它把 HF 配置读取、Megatron provider 构造、模型实例化前的配置转换、HF <-> Megatron 权重转换，都委托给 Megatron-Bridge 的 `AutoBridge`。
+
+Megatron-Bridge 的模型支持是“导入即注册”：具体 bridge 类在 import 时通过 `@MegatronModelBridge.register_bridge(...)` 写入全局 dispatch registry。后续 `AutoBridge` 只需要根据 HF config 中的 `architectures` 查 registry。
+
+MindSpeed-Bridge 因此不需要重写 `verl` 的 worker、engine、checkpoint、PEFT、DDP 包装或 PPO/GRPO 逻辑。它只需要提供 Qwen3.5-VL 相关的 bridge、provider、Megatron 模型实现、权重映射和 NPU 友好的 GDN 算子路径。
+
+`import mindspeed_bridge.models` 的作用不是让 `verl` 直接调用 MindSpeed-Bridge API，而是触发 MindSpeed-Bridge 中 Qwen3.5-VL bridge 类定义，从而把新架构注册进 Megatron-Bridge 的同一个 registry。注册完成后，`verl` 继续使用原来的 `AutoBridge` 调用链。
+
+### 1.3 总体架构
+
+整体可以理解为：`verl` 调用 Megatron-Bridge，MindSpeed-Bridge 通过 import side effect 扩展 Megatron-Bridge 的模型 registry。
+
+```mermaid
+flowchart LR
+    A[verl 训练/保存/加载流程] --> B[Megatron-Bridge AutoBridge]
+    B --> C[Megatron-Bridge dispatch registry]
+    D[MindSpeed-Bridge import side effect] --> C
+    C --> E[Qwen3.5-VL Bridge]
+    E --> F[Qwen3.5-VL Provider]
+    F --> G[Megatron-Core Qwen3VLModel]
+    G --> H[MindSpeed / Ascend GDN kernels]
+```
+
+## 2. Scope A：Megatron-Bridge 基线能力与 verl 调用链
+
+### 2.1 Megatron-Bridge 本身包括什么
 
 从本地 `Megatron-Bridge/src/megatron/bridge` 目录看，Megatron-Bridge 是一个覆盖面较大的库，主要包含：
 
@@ -35,7 +57,7 @@ Megatron-Bridge 在 README 中的定位是 Hugging Face 与 Megatron-Core 之间
 
 ![Megatron-Bridge 原始架构图](./Repo-Mbridge.png)
 
-## 3. Megatron-Bridge 的核心机制
+### 2.2 Megatron-Bridge 的核心注册机制
 
 Megatron-Bridge 采用三层模型桥接模式：
 
@@ -70,16 +92,14 @@ flowchart TD
     J --> L[HF <-> Megatron 权重转换]
 ```
 
-## 4. Megatron-Bridge 在 verl 里的作用
+### 2.3 Megatron-Bridge 在 verl 里的作用
 
 `verl` 的 Megatron engine 当前要求 `use_mbridge=True`。它有两条路径：
 
-- `vanilla_mbridge=True`：走旧的 `mbridge` 包，入口是 `verl/verl/models/mcore/mbridge.py`。
-- `vanilla_mbridge=False`：走 Megatron-Bridge，入口是 `verl/verl/models/mcore/bridge.py`。
+1. `vanilla_mbridge=True`：走旧的 `mbridge` 包，入口是 `verl/verl/models/mcore/mbridge.py`。
+2. `vanilla_mbridge=False`：走 Megatron-Bridge，入口是 `verl/verl/models/mcore/bridge.py`。
 
-本方案讨论的是第二条路径。
-
-`verl` 非 `vanilla_mbridge` 的主流程如下：
+本方案讨论的是第二条路径。`verl` 非 `vanilla_mbridge` 的主流程如下：
 
 1. `verl/verl/workers/engine/megatron/transformer_impl.py:190` 从 `verl.models.mcore.bridge` 导入 `AutoBridge`。
 2. `transformer_impl.py:193` 用 `AutoBridge.from_hf_pretrained(self.model_config.local_path, trust_remote_code=...)` 读取 HF 模型。
@@ -121,7 +141,9 @@ flowchart LR
     D --> H
 ```
 
-## 5. MindSpeed-Bridge 包含什么
+## 3. Scope B：MindSpeed-Bridge 增量、注册接入与 import 生效机制
+
+### 3.1 MindSpeed-Bridge 包含什么
 
 从本地 `MindSpeed-Bridge/mindspeed_bridge` 看，当前 MindSpeed-Bridge 是一个很薄的 Megatron-Bridge 扩展包，主要内容是：
 
@@ -137,7 +159,7 @@ flowchart LR
 
 MindSpeed-Bridge README 也说明它是在 Megatron-Bridge 基础上面向昇腾平台提供更多模型支持、精度验证和硬件亲和性能优化；当前本地仓库的“最新消息”说明创建于 2026-05，并提供 Qwen3.5-VL 支持。
 
-## 6. 为什么 MindSpeed-Bridge 只需要这些东西
+### 3.2 为什么只需要这些东西
 
 verl 接入 Megatron-Bridge 时真正需要的是四类能力：
 
@@ -163,7 +185,7 @@ MindSpeed-Bridge 因此只需要补齐 Qwen3.5-VL 的模型差异：
 
 换句话说，MindSpeed-Bridge 是“模型支持插件”，不是新的训练框架。
 
-## 7. MindSpeed-Bridge 与 register_bridge 机制
+### 3.3 MindSpeed-Bridge 与 register_bridge 机制
 
 `MindSpeed-Bridge/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py` 中有两个关键注册：
 
@@ -215,7 +237,7 @@ sequenceDiagram
     AB->>MB: mapping_registry() + load_weights_hf_to_megatron()
 ```
 
-## 8. 为什么在 bridge.py 里 import mindspeed_bridge 就能生效
+### 3.4 为什么在 bridge.py 里 import mindspeed_bridge 就能生效
 
 `verl/verl/models/mcore/bridge.py` 当前核心代码是：
 
@@ -285,7 +307,9 @@ flowchart TD
 - `transformers` 版本满足 Qwen3.5 配置类要求；本地 MindSpeed-Bridge requirements 使用 `transformers==5.3.0`，MoE provider 内部要求 `>=5.2.0`。
 - GDN 路径所需的 `mindspeed`、`torch_npu` / `torch.ops.npu` 自定义算子和相关 kernel 已安装并匹配运行环境。
 
-## 9. Qwen3.5-VL provider 与模型构造
+## 4. Scope C：Qwen3.5-VL 模型适配、GDN 算子与落地建议
+
+### 4.1 Qwen3.5-VL provider 与模型构造
 
 MindSpeed-Bridge 的 Qwen3.5-VL provider 做了两件事：
 
@@ -309,7 +333,7 @@ MoE bridge 的 `provider_bridge()` 主要设置：
 
 这部分是 MindSpeed-Bridge 必须提供的原因：Qwen3.5-VL 不是纯 GPT decoder，也不是所有层同构 attention；如果只依赖 Megatron-Bridge 通用 GPT provider，无法表达“3 个 GDN 层 + 1 个标准 attention 层”的混合结构，也无法正确处理 VLM 的 mRoPE 和 vision encoder。
 
-## 10. 参数映射设计
+### 4.2 参数映射设计
 
 Qwen3.5-VL 的 bridge 通过 `mapping_registry()` 返回 Megatron-Bridge 的 `MegatronMappingRegistry`。关键映射包括：
 
@@ -331,7 +355,7 @@ Qwen3.5-VL 的 bridge 通过 `mapping_registry()` 返回 Megatron-Bridge 的 `Me
 
 `GDNLinearMappingSeparate` 是 MindSpeed-Bridge 的关键新增映射。它的作用是把 HF 的四个独立投影张量先重组成 Megatron-Bridge 既有工具期望的 grouped `qkvz` / `ba` 中间格式，再复用 `merge_gdn_linear_weights()` / `split_gdn_linear_weights()` 的 TP 分片逻辑。这样避免重写 Megatron-Bridge 的 GDN TP 处理。
 
-## 11. GDN 算子路径
+### 4.3 GDN 算子路径
 
 核心选择逻辑在 `MindSpeed-Bridge/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py:194`：
 
@@ -359,72 +383,19 @@ flowchart LR
     I --> J[out_proj]
 ```
 
-### 11.1 Triton / MindSpeed kernel 路径
+具体路径如下：
 
-触发条件：
+| 路径 | 触发条件 | 执行函数 | 主要特点 |
+| --- | --- | --- | --- |
+| Triton / MindSpeed kernel | `HAVE_FLA=True` 且 `config.use_triton_gdn=True` | `chunk_gated_delta_rule` | 主要使用 `mindspeed.ops.triton.*` kernel，包括 `chunk_local_cumsum`、`chunk_scaled_dot_kkt_fwd`、`solve_tril`、`chunk_fwd_o` 等 |
+| Ascend C / NPU flash | 未命中 Triton 路径，且 `config.use_ascend_gdn=True` | `flash_gated_delta_rule` | 前半段使用 MindSpeed Triton 辅助算子，核心 forward/backward 通过 `torch.ops.npu.*` Ascend C 算子执行 |
+| Torch fallback | 不启用 Triton GDN，且不启用 Ascend GDN | `torch_chunk_gated_delta_rule` | deterministic / fallback 路径；当前不支持 `cu_seqlens`；性能预期低于专用 kernel |
 
-- `HAVE_FLA=True`，即 `chunk_gated_delta_rule` 成功 import。
-- `config.use_triton_gdn=True`。
+Ascend C / NPU flash 路径是 Ascend 集成最核心的性能路径。它在 `flash_gated_delta_rule.py` 中会把数据从 `[B, H, T, D]` 转为 Ascend C 算子需要的 `[T, B, H, D]`，forward 调用 `torch.ops.npu.npu_recompute_w_u_fwd`、`torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h`、`torch.ops.npu.npu_chunk_fwd_o`，backward 调用 `torch.ops.npu.npu_chunk_bwd_dv_local`、`torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu`、`torch.ops.npu.npu_chunk_bwd_dqkwg`、`torch.ops.npu.npu_prepare_wy_repr_bwd_da`、`torch.ops.npu.npu_prepare_wy_repr_bwd_full`。
 
-执行函数：
+GDN layer 在进入 `gated_delta_rule` 前还会对 q/k/v 做 depthwise causal conv。如果 `causal_conv1d` 不存在，或 `config.deterministic_mode=True`，使用 `torch.nn.functional.conv1d`；否则使用 `causal_conv1d` 包的 optimized path。这不是第 194 行的三选一逻辑，但会影响 GDN 的整体性能和 packed sequence 行为。
 
-- `mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.chunk_gated_delta_rule.chunk_gated_delta_rule`
-
-核心流程在 `chunk_gated_delta_rule.py`：
-
-- `chunk_local_cumsum` 计算分块 gating 累积。
-- `chunk_scaled_dot_kkt_fwd` 和 `solve_tril` 构造 WY representation。
-- `recompute_w_u_fwd`、`chunk_gated_delta_rule_fwd_h`、`chunk_fwd_o` 完成 forward。
-- backward 走 `chunk_bwd_dv_local`、`chunk_gated_delta_rule_bwd_dhu`、`chunk_bwd_dqkwg`、`prepare_wy_repr_bwd`。
-
-这条路径主要使用 `mindspeed.ops.triton.*` kernel，适合具备对应 Triton/MindSpeed kernel 的环境。
-
-### 11.2 Ascend C / NPU flash 路径
-
-触发条件：
-
-- `config.use_triton_gdn` 未命中，且 `config.use_ascend_gdn=True`。
-
-执行函数：
-
-- `mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.flash_gated_delta_rule.flash_gated_delta_rule`
-
-核心流程在 `flash_gated_delta_rule.py`：
-
-- 前半段仍使用 MindSpeed Triton 辅助算子完成 `chunk_local_cumsum`、`chunk_scaled_dot_kkt_fwd`、`solve_tril`。
-- 然后把数据从 `[B, H, T, D]` 转成 Ascend C 算子需要的 `[T, B, H, D]`。
-- forward 调用 `torch.ops.npu.npu_recompute_w_u_fwd`、`torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h`、`torch.ops.npu.npu_chunk_fwd_o`。
-- backward 调用 `torch.ops.npu.npu_chunk_bwd_dv_local`、`torch.ops.npu.npu_chunk_gated_delta_rule_bwd_dhu`、`torch.ops.npu.npu_chunk_bwd_dqkwg`、`torch.ops.npu.npu_prepare_wy_repr_bwd_da`、`torch.ops.npu.npu_prepare_wy_repr_bwd_full`。
-
-这条路径是 Ascend / NPU 集成最核心的性能路径。MindSpeed-Bridge 示例脚本中通过 `++model.use_ascend_gdn=True` 打开该路径；在 `verl` 中需要确保等价配置最终进入 provider / TransformerConfig。
-
-### 11.3 Torch fallback 路径
-
-触发条件：
-
-- 不启用 Triton GDN，且不启用 Ascend GDN。
-
-执行函数：
-
-- `mindspeed_bridge.models.qwen_vl.modelling_qwen3_vl.chunk_gated_delta_rule.torch_chunk_gated_delta_rule`
-
-特点：
-
-- 作为 deterministic / fallback 路径存在。
-- 当前实现不支持 `cu_seqlens`。
-- 会把 q/k/v/beta/g 转成 float32 做分块计算，再转回初始 dtype。
-- 性能预期低于专用 Triton 或 NPU kernel。
-
-### 11.4 前置 causal conv 路径
-
-GDN layer 在进入 `gated_delta_rule` 前还会对 q/k/v 做 depthwise causal conv：
-
-- 如果 `causal_conv1d` 不存在，或 `config.deterministic_mode=True`，使用 `torch.nn.functional.conv1d`。
-- 否则使用 `causal_conv1d` 包的 optimized path。
-
-这不是第 194 行的三选一逻辑，但它会直接影响 GDN 的整体性能和 packed sequence 行为。
-
-## 12. verl 集成建议
+### 4.4 verl 集成建议与风险
 
 推荐落地方式：
 
@@ -432,33 +403,14 @@ GDN layer 在进入 `gated_delta_rule` 前还会对 q/k/v 做 depthwise causal c
 2. 运行 Qwen3.5-VL / MindSpeed-Bridge 时使用 `use_mbridge=True`、`vanilla_mbridge=False`。
 3. 在 `verl` 的 Megatron engine provider override 中确保 GDN 路径开关进入最终 config，例如 Ascend 场景启用 `use_ascend_gdn=True`，并明确关闭或不启用 `use_triton_gdn`，避免优先命中 Triton 路径。
 4. 确认运行环境包含 MindSpeed-Bridge、MindSpeed、torch_npu / NPU 自定义算子、匹配的 `transformers` 版本。
-5. 首次联调建议先验证 registry：
-   - `AutoBridge.list_supported_models()` 应包含 `Qwen3_5ForConditionalGeneration` 和 `Qwen3_5MoeForConditionalGeneration`。
-   - 对目标 HF 目录调用 `AutoBridge.from_hf_pretrained(...).to_megatron_provider(load_weights=False)` 应返回 MindSpeed provider。
+5. 首次联调建议先验证 registry：`AutoBridge.list_supported_models()` 应包含 `Qwen3_5ForConditionalGeneration` 和 `Qwen3_5MoeForConditionalGeneration`；对目标 HF 目录调用 `AutoBridge.from_hf_pretrained(...).to_megatron_provider(load_weights=False)` 应返回 MindSpeed provider。
 6. 权重加载失败时优先检查 `mapping_registry()` 中 HF 参数名是否与实际 checkpoint 对齐，尤其是 GDN 的 `in_proj_qkv/in_proj_z/in_proj_b/in_proj_a` 和 MoE expert 命名。
 
-## 13. 风险与待确认项
+需要关注的风险：
 
 1. `bridge.py` 当前对 `mindspeed_bridge.models` 的 `ModuleNotFoundError` 会直接 re-raise，因此非 Ascend / 非 MindSpeed 环境也会因为缺少 MindSpeed-Bridge 而无法使用 Megatron-Bridge 路径。如果希望保持通用性，应考虑把该 import 做成可选能力，或只在 Ascend/Qwen3.5-VL 配置下启用。
 2. `GatedDeltaNet` 直接读取 `config.use_triton_gdn` 和 `config.use_ascend_gdn`。需要确认 `verl` provider override 后，这两个属性一定存在；否则会在构造 GDN layer 时失败。
 3. Ascend flash 路径依赖 `torch.ops.npu.*` 自定义算子。源码只在 import 时尝试 `import fla_npu`，但实际执行时若 NPU op 未注册，会在运行期失败。
 4. `torch_chunk_gated_delta_rule` 不支持 `cu_seqlens`，不能作为 packed variable-length 训练的完整性能路径。
 5. 当前文档结论基于本地源码静态阅读，未运行训练、推理或单元测试；本地 workspace 说明也不建议在未明确要求时运行 ML runtime。
-
-## 14. 总结
-
-MindSpeed-Bridge 在 `verl` 上的集成点很小，但不是因为功能少，而是因为 Megatron-Bridge 已经把“模型注册、provider 构造、权重映射、加载导出”抽象成统一机制。MindSpeed-Bridge 只要在 import 阶段把 Qwen3.5-VL bridge 注册进去，并提供能构造 NPU 友好 Megatron 模型的 provider 和 GDN 算子，`verl` 原有的 Megatron engine 就能通过 `AutoBridge` 自动拿到新模型支持。
-
-最终架构可以理解为：
-
-```mermaid
-flowchart LR
-    A[verl 训练/保存/加载流程] --> B[Megatron-Bridge AutoBridge]
-    B --> C[Megatron-Bridge dispatch registry]
-    D[MindSpeed-Bridge import side effect] --> C
-    C --> E[Qwen3.5-VL Bridge]
-    E --> F[Qwen3.5-VL Provider]
-    F --> G[Megatron-Core Qwen3VLModel]
-    G --> H[MindSpeed / Ascend GDN kernels]
-```
 

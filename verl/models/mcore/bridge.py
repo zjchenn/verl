@@ -15,6 +15,10 @@
 
 try:
     from megatron.bridge import AutoBridge
+    try:
+        import mindspeed_bridge.models
+    except ModuleNotFoundError as e:
+        raise
     from megatron.bridge.training.utils.train_utils import LinearForLastLayer, freeze_moe_router, make_value_model
 except ImportError:
     # `pip install verl[mcore]` or
